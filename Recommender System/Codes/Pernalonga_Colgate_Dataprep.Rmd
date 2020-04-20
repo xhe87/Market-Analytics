@@ -1,0 +1,364 @@
+---
+title: "Pernalonga 2 - Data Prep"
+output: html_notebook
+---
+
+The first block of code will perform data cleaning based on the data anamolies we found in the first Project. 
+
+```{r}
+
+#First, load all required packages
+
+library(data.table)
+library(dplyr)
+library(stringr)
+library(tidyverse)
+library(cluster)
+library(factoextra)
+library(psych)
+
+#Load the datasets
+
+transactions <- fread("C:/Users/harsh/Desktop/MSBA/Spring/Marketing Analytics/Projects/Project 1/Pernalonga/transaction_table.csv")
+products <-fread("C:/Users/harsh/Desktop/MSBA/Spring/Marketing Analytics/Projects/Project 1/Pernalonga/product_table.csv")
+
+##Data Prep
+
+#Map product id's to other product features by joining the two tables
+merged_data <- merge(transactions, products, by='prod_id', all=TRUE)
+
+#Handle data anamolies
+length(unique(merged_data$tran_id)) #Only 753 unique transaction_id's - Need to make a new transaction id, as the one available is not unique, duplicated very very often and thus prone to errors
+
+#Since each transaction may have multiple rows (depending on number of products types in a transaction), not possible to accurately determinew which transactions were made together
+#Way around: Combine customer_id's, store_id's, and purchase date to make a single transaction id as most customers would only make 1 purchase a day at a particular store
+
+#Bring transaction date to date format
+merged_data$date <- as.Date(merged_data$tran_dt)
+
+#If a customer has >1 transactions on the same day in the same store, assume it was the same transaction
+merged_data$new_transaction_id <- paste(merged_data$cust_id,merged_data$tran_dt,merged_data$store_id)
+
+#Verify the amount paid is consistent with (unit price * quantity - discount amount)
+merged_data$transaction_amount <- (merged_data$prod_unit_price * merged_data$tran_prod_sale_qty) - abs(merged_data$tran_prod_discount_amt)
+
+#About 33% product prices are not consistent (10 mil out of 29.6mil)
+merged_data$IS_CONSISTENT_FINAL_AMOUNT <- ifelse(merged_data$tran_prod_paid_amt==merged_data$transaction_amount,1,0)
+inconsistent_prices <- filter(merged_data,merged_data$IS_CONSISTENT_FINAL_AMOUNT==0) 
+
+#How much is this inconsistency?
+head(sort(merged_data$difference,decreasing=T),5) #Very minor differences (e-08 at most), likely due to rounding
+
+#We noticed some transaction amounts are negative, so we removed these from our analysis
+
+merged_data <- merged_data[merged_data$tran_prod_paid_amt>0,]
+
+```
+
+As a first step into EDA, see how many customers bought a private label toothpaste atleast once and then remove from from our data. Our focus will only be on customers who aren't private label toothpaste customers
+
+```{r}
+
+# A restriction for all campaigns except for #11 is customers who purchase Pernalonga's PRIVATE LABEL equivalent of the promoted brand should not be targeted.
+# remove transactions that are for PRIVATE LABEL
+private_label <- merged_data[merged_data$brand_desc == 'PRIVATE LABEL' & merged_data$category_desc_eng == 'TOOTHPASTE',]
+private_label_cust <- data.frame(unique(private_label$cust_id))
+
+# only keep transactions for customers that haven't bought private label
+no_private_label <- merged_data[!merged_data$cust_id %in% private_label_cust$unique.private_label.cust_id.,]
+
+#How many customers bought toothpaste that was not private label?
+length(unique(no_private_label$cust_id))
+
+
+```
+
+Next, find loyal customers by doing some calculations. 
+
+1) See each customer's spend on each brand (to look at Colgate as a brand)
+2) See each customer's spend on each product category (to look at overall toothpaste sales to each customer)
+3) See each customer's spend on each product category from each brand (to look at colgate toothpaste sales for each customer)
+
+```{r}
+
+#Identify each customer's spend on each brand (used for spend on all colgate products)
+no_private_label <- no_private_label %>%
+  group_by(cust_id,brand_desc) %>%
+  mutate(brand_spend= sum(tran_prod_paid_amt))
+
+#Identify each customer's spend on each product category (used for overall spend on Toothpastes (any brand))
+no_private_label <- no_private_label %>%
+  group_by(cust_id,category_desc_eng) %>%
+  mutate(category_spend= sum(tran_prod_paid_amt))
+
+
+#Identify each customer's spend on each category in brand (used for spend on Toothpaste of each brand)
+no_private_label <- no_private_label %>%
+  group_by(cust_id,brand_desc,category_desc_eng)%>%
+  mutate(brand_category_spend=sum(tran_prod_paid_amt))
+
+#Get transactions limited to toothpaste
+toothpaste <- filter(no_private_label,category_desc_eng=="TOOTHPASTE")
+
+#Get transactions for all colgate products
+colgate <- filter(no_private_label,brand_desc=="COLGATE")
+
+#Focus on customers and their transactions on either COLGATE products(toothpaste or otherwise) or TOOTHPASTE products (any brand), accounting for overlapping transactions only once
+colgate_or_anytoothpaste <- unique(rbind(toothpaste,colgate))
+
+colgate_or_anytoothpaste <- distinct_at(colgate_or_anytoothpaste,.vars = c("cust_id","brand_desc","category_desc_eng") ,.keep_all = T)
+
+#For each customer, obtain amount spent on colgate products
+
+colgate_spend <- filter(colgate_or_anytoothpaste,brand_desc=="COLGATE")
+colgate_spend <- colgate_spend[,c("cust_id","brand_spend")]
+colgate_spend <- distinct_at(colgate_spend,.vars="cust_id",.keep_all = T)
+
+#For each customer, obtain amount spent on colgate toothpaste only
+
+colgate_toothpaste_spend <- filter(colgate_or_anytoothpaste,brand_desc=="COLGATE" & category_desc_eng=="TOOTHPASTE")
+colgate_toothpaste_spend <- colgate_toothpaste_spend[,c("cust_id","brand_category_spend")]
+colgate_toothpaste_spend <- distinct_at(colgate_toothpaste_spend,.vars="cust_id",.keep_all = T)
+
+#For each customer, obtain amount spent on all toothpastes
+toothpaste_spend <- filter(colgate_or_anytoothpaste,category_desc_eng=="TOOTHPASTE")
+toothpaste_spend <- toothpaste_spend[,c("cust_id","category_spend")]
+toothpaste_spend <- distinct_at(toothpaste_spend,.vars="cust_id",.keep_all = T)
+
+#Get list of these customers and store their total spends on toothpaste, colgate, and colgate toothpaste
+target_customers <- as.data.frame(unique(colgate_or_anytoothpaste$cust_id))
+names(target_customers) <- "cust_id"
+target_customers <- plyr::join_all(list(target_customers,colgate_spend,colgate_toothpaste_spend,toothpaste_spend),by="cust_id",type="left")
+
+#Replace NA's with 0 as some customers did not purchase in all 3 categories
+
+target_customers[is.na(target_customers)] <- 0
+
+#Rename columns for convenience and easy understanding
+names(target_customers) <- c("cust_id","Colgate_Spend","Colgate_Toothpaste_Spend","Total_Toothpaste_Spend")
+
+```
+
+We have a list of 3596 target customers - let's split them into "baseline segment", and "target for promotion segments"
+
+Criteria for baseline segment: Loyal colgate toothpaste customer who
+a) Spends atleast 70% of his money spent on toothpaste on Colgate 
+b) Is in the top quartile of colgate toothpaste customers based on overall sales
+
+```{r}
+
+#Define cutoffs to be selected as baseline
+colgate_toothpaste_spend_cutoff <- quantile(target_customers$Colgate_Toothpaste_Spend,0.75)
+colgate_toothpaste_ratio_cutoff <- 0.7
+
+#Calculate ratio of colgate toothpaste spend to total toothpaste spend
+target_customers$toothpaste_ratio <- target_customers$Colgate_Toothpaste_Spend/target_customers$Total_Toothpaste_Spend
+
+#Identify baseline customers
+baseline_customers <- filter(target_customers,target_customers$Colgate_Toothpaste_Spend >= colgate_toothpaste_spend_cutoff & target_customers$toothpaste_ratio>=colgate_toothpaste_ratio_cutoff)
+
+#Customers in the target list that are not in the baseline category
+remaining_customers <- setdiff(target_customers,baseline_customers)
+
+#Next, let's setup a list of customers we will send personalized promotions to based on similarity with baseline customers
+
+#As we recommend launching a pilot, we only want to target customers that a) Spend on colgate products (other than toothpaste), or b) Spend on other toothpastes
+
+#Discard customers with very low spends on both (25th percentile and below) because they likely wont purchase Colgate toothpaste based on their historical sales
+
+promotion_customers <- filter(remaining_customers,remaining_customers$Colgate_Spend> quantile(remaining_customers$Colgate_Spend,0.25) | remaining_customers$Total_Toothpaste_Spend >quantile(remaining_customers$Total_Toothpaste_Spend,0.25))
+
+promotion_customer_ids <- promotion_customers$cust_id
+
+```
+
+Find the products that these baseline customers spent the most money on. We will find similar users based on their spend on these top products
+
+```{r}
+
+#Store customer id's for these baseline customers
+baseline_customer_ids <- unique(baseline_customers$cust_id)
+
+#Calculate the money spent by each baseline customer on each product 
+
+no_private_label <- no_private_label %>%
+  group_by(cust_id,prod_id) %>%
+  mutate(prod_category_spend= sum(tran_prod_paid_amt))
+
+#Keep only the baseline customers and keep relevant columns only
+baseline_no_private_label <- no_private_label[no_private_label$cust_id %in% baseline_customer_ids, c("cust_id","prod_id","tran_prod_paid_amt","prod_category_spend")]
+
+#Keep one row per customer per product category
+baseline_no_private_label <- distinct_at(baseline_no_private_label,.vars=c("cust_id","prod_id"),.keep_all = T)
+
+#Calculate overall spend on each product from all baseline customers in total -- This will be used to shortlist the Top X products with Maximum money spent
+
+baseline_no_private_label <- baseline_no_private_label %>%
+  group_by(prod_id) %>%
+  mutate(total_prod_sales= sum(tran_prod_paid_amt))
+
+#Keep relevant columns and keep only 1 row per product 
+prod_sales_baseline <- distinct_at(baseline_no_private_label,.vars = "prod_id",.keep_all = T)
+prod_sales_baseline <- prod_sales_baseline[,c("prod_id","total_prod_sales")]
+
+#Sort by descending order of spend
+prod_sales_baseline <- arrange(prod_sales_baseline,desc(total_prod_sales))
+
+#How many products to get 80% sales? We are not considering the bottom 20% products for this segment because it would bring noise to the data and increase computation time
+
+cumsum(prod_sales_baseline$total_prod_sales)[5000]/sum(prod_sales_baseline$total_prod_sales) #82%
+
+#Identify top X products for baseline customers
+top_n <- 5000
+top_products <- prod_sales_baseline$prod_id[1:top_n] #Stores product id's for top X products
+
+
+```
+
+Now, make a dataframe that contains all baseline customers (rows) and their individual spends on these top 5000 products
+
+```{r}
+
+#Keep only observations for the top 5000 products for baseline customers
+baseline_no_private_label <- baseline_no_private_label[baseline_no_private_label$prod_id %in% top_products, c("cust_id","prod_id","prod_category_spend")]
+
+#Change data from long to wide format - customers in rows, products in columns, product spend as values
+baseline_no_private_label <- pivot_wider(baseline_no_private_label,names_from=prod_id,values_from=prod_category_spend)
+
+#Replace NA's with 0s
+baseline_no_private_label[is.na(baseline_no_private_label)] <- 0
+
+```
+
+Finally, make a dataframe that contains all targeted customers (rows) and their individual spends on these top 5000 products (same products as baseline customers)
+
+```{r}
+
+target_no_private_label <- no_private_label[no_private_label$cust_id %in% promotion_customer_ids, c("cust_id","prod_id","prod_category_spend")]
+
+#Keep one row per customer per product category
+target_no_private_label <- distinct_at(target_no_private_label,.vars=c("cust_id","prod_id"),.keep_all = T)
+
+#Keep only observations for the top X products that similarity will be measured on
+target_no_private_label <- target_no_private_label[target_no_private_label$prod_id %in% top_products,]
+
+#Change data from long to wide format - customers in rows, products in columns, product spend as values
+target_no_private_label <- pivot_wider(target_no_private_label,names_from=prod_id,values_from=prod_category_spend)
+
+#Replace NA's with 0s
+target_no_private_label[is.na(target_no_private_label)] <- 0
+
+
+```
+
+Save the files to measure similarity later - Performed in "Pernalonga_PSIM_and_NaiveBayes.R"
+
+```{r}
+
+fwrite(target_no_private_label,"Target_customers_input.csv")
+fwrite(baseline_no_private_label,"baseline_customers_input.csv")
+fwrite(no_private_label,"no_private_label.csv")
+
+```
+
+
+Naive Bayes data prep below
+
+
+```{r}
+
+#Calculate Probability for colgate toothpaste purchase on the target universe (including those we discarded based on similarity)
+
+num_customers <- length(unique(no_private_label$cust_id))
+colgate_toothpaste_transactions <- filter(no_private_label,category_desc_eng=="TOOTHPASTE" & brand_desc=="COLGATE")
+colgate_customers <- unique(colgate_toothpaste_transactions$cust_id)
+num_colgate_toothpaste_cust <- length(unique(colgate_toothpaste_transactions$cust_id))
+
+#Calculate probabilities
+PBuyColgate <- num_colgate_toothpaste_cust/num_customers
+PNotBuyColgate <- 1 - PYes
+
+```
+
+Now calculate mean and standard deviation for each product across the customer base (3799 customers)
+
+```{r}
+
+#Spread the dataframe - customers in rows, 5k products in columns and overall sales as values
+universe_no_private_label <- no_private_label[no_private_label$prod_id %in% top_products,c("cust_id","prod_id","prod_category_spend")]
+universe_no_private_label <- distinct_at(universe_no_private_label,.vars = c("cust_id","prod_id") ,.keep_all = T)
+universe_no_private_label <- pivot_wider(universe_no_private_label,names_from=prod_id,values_from=prod_category_spend)
+universe_no_private_label[is.na(universe_no_private_label)] <- 0
+
+#Colgate customers only
+
+colgate_customers_spendbyproduct <- universe_no_private_label[universe_no_private_label$cust_id %in% colgate_customers,]
+non_colgate_customers_spendbyproduct <- universe_no_private_label[!universe_no_private_label$cust_id %in% colgate_customers,]
+
+#Calculate mean and standard deviation for these two customer groups
+
+colgate_cust_meanspend <- colMeans(colgate_customers_spendbyproduct[,2:ncol(colgate_customers_spendbyproduct)])
+colgate_cust_sdspend <- apply(colgate_customers_spendbyproduct[,2:ncol(colgate_customers_spendbyproduct)],2,sd)
+
+non_colgate_cust_meanspend <- colMeans(non_colgate_customers_spendbyproduct[,2:ncol(non_colgate_customers_spendbyproduct)])
+non_colgate_cust_sdspend <- apply(non_colgate_customers_spendbyproduct[,2:ncol(non_colgate_customers_spendbyproduct)],2,sd)
+
+#Save these two as dataframes
+
+colgate_cust_summary <- as.data.frame(rbind(colgate_cust_meanspend,colgate_cust_sdspend))
+non_colgate_cust_summary <- as.data.frame(rbind(non_colgate_cust_meanspend,non_colgate_cust_sdspend))
+
+fwrite(colgate_cust_summary,"colgate_cust_summary.csv")
+fwrite(non_colgate_cust_summary,"non_colgate_cust_summary.csv")
+
+#Did each customer buy colgate toothpaste in the past?
+colgate_customers_transactions$Bought_Colgate <- ifelse(colgate_customers_transactions$cust_id %in% colgate_customers,1,0)
+
+#Save each target customer's sales data and whether they bought colgate toothpaste or not
+fwrite(colgate_customers_transactions,"all_customers_sales.csv") #file used in "PSIM_and_NaiveBayes.R"
+
+
+```
+
+Finally, complete Incremental Sales and Volume analysis based on target customers & loyal customers output from "PSIM_and_NaiveBayes.R"
+
+```{r}
+
+#Load dataframe of each customer to be targetted, their segment & probability of purchase
+promo_list <-fread("C:/Users/harsh/Desktop/MSBA/Spring/Marketing Analytics/Projects/Project 2/promo_list.csv")
+
+
+#Make mode function
+getmode <- function(v) {
+   uniqv <- unique(v)
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+#Add segment to each customer id (baseline vs target)
+colgate_toothpaste_only <- left_join(colgate_toothpaste_only,promo_list[,c("cust_id","cust_type")])
+
+#Calculate segment level stats for ROI analysis - mean paid amount, sale price without discount, number of units sold (for historical distribution)
+colgate_tooth_unitprice_by_subcat <- colgate_toothpaste_only %>%
+  group_by(sub_category_desc,cust_type) %>%
+  mutate(most_common_paid_price= mean(tran_prod_paid_amt/tran_prod_sale_qty),
+         most_common_sale_price=getmode(tran_prod_sale_amt/tran_prod_sale_qty),
+         units_sold = sum(tran_prod_sale_qty))
+
+#Calculate current sales distribution between subcategories
+colgate_tooth_unitprice_by_subcat <- colgate_tooth_unitprice_by_subcat %>%
+  group_by(cust_type) %>%
+  mutate(distribution= units_sold/sum(tran_prod_sale_qty))
+
+#Keep 1 row for each sub-category to get all statistics on the sub-category level
+colgate_tooth_unitprice_by_subcat <-  distinct_at(colgate_tooth_unitprice_by_subcat[,c("sub_category_desc","most_common_paid_price","cust_type","most_common_sale_price","distribution")],.vars = "sub_category_desc",.keep_all = T)
+
+total_expected_sales_baseline <- 696 #Calculate based on Customers targeted * Avg units/transaction in that segment
+total_expected_sales_target <- 309 
+
+#Expected units sold = Units distribution for that sub-category in that segment * Overall units expected to be sold in that segment
+colgate_tooth_unitprice_by_subcat$Expected_Units_sold <- ifelse(colgate_tooth_unitprice_by_subcat$cust_type=="Baseline",colgate_tooth_unitprice_by_subcat$distribution*total_expected_sales_baseline,colgate_tooth_unitprice_by_subcat$distribution*total_expected_sales_target)
+
+fwrite(colgate_tooth_unitprice_by_subcat,"ROI.csv") #Output for report
+
+```
+

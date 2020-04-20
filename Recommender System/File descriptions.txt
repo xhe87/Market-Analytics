@@ -1,0 +1,18 @@
+R files:
+
+1) Pernalonga_Colgate_Dataprep.R
+	a) Contains all data cleaning and data prep code, including some data cleaning code from Project-1
+	b) Prepares multiple data files that serve as inputs for PSIM and NaiveBayes models
+	c) Performs Incremental Revenue and Volume analysis
+
+2) Pernalonga_Colgate_PSIM_NaiveBayes.R
+	a) Calculates PSIM between Baseline and Target customers based on input files created previously
+	b) Contains code for NaiveBayes model that predicts probability of purchase for both segments
+
+3) Pernalonga_Colgate_Subcategory EDA.R
+	a) Contains EDA at a subcategory level of toothpastes, including consumer behavior and price pattern changes between 2016 and 2017
+	b) Contains simple elasticity analysis of each customer 
+
+CSV file:
+1) Colgate_Targeting_List.csv
+	a) Contains all Baseline and Target customer id's, their PSIM scores and probabilities from NaiveBayes. Type of promotion can be confirmed by looking at the segment of each customer
